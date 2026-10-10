@@ -1,0 +1,253 @@
+# CC-FLUX 2026 Software Manual
+
+**Integrated post-flight scientific payload review for the CC-FLUX Zeppelin campaign 2026**
+
+This manual describes the distributable folder, the normal processing workflow, instrument responsibilities, time handling, project files, and result pages.
+
+## 1. Starting the software
+
+### Windows
+
+1. Double-click **Windows_CCFLUX.bat**.
+2. Keep the Command Prompt window open.
+3. The launcher creates **.venv-windows**, installs or verifies all required Python libraries, starts CC-FLUX on a free local port, and opens the default browser.
+
+### macOS
+
+1. Double-click **Mac_CCFLUX.command**.
+2. Keep the Terminal window open.
+3. The launcher creates **.venv-macos**, installs or verifies all required Python libraries, starts CC-FLUX on a free local port, and opens the default browser.
+
+Python 3.10 or newer is required. If the launcher does not find a supported interpreter, it reports the version it found and offers to download the official Python 3.12.7 installer from python.org and open it. Nothing is installed without your confirmation, and any existing Python installation is left in place; you may also decline and install Python yourself. On Windows, select "Add python.exe to PATH" during installation, then run the launcher again.
+
+An internet connection is normally required during the first launch. Launcher diagnostics are written to **logs/launcher.log**.
+
+## 2. Distribution folder structure
+
+* **Windows_CCFLUX.bat** — Windows setup and launcher.
+* **Mac_CCFLUX.command** — one-MacOS setup and launcher.
+* **app/** — local web server, dashboard controller, GUI pages, maps, plots, JavaScript, CSS, and images.
+* **core/** — scanning, time handling, instrument registry, processing queue, resources, logging, project persistence, camera georeferencing, and artifact management.
+* **instruments/** — integrated adapters for every payload instrument.
+* **instruments/sif/essentials/** — SIF calibration files and vegetation-index definitions distributed with the software.
+* **configs/** — instrument detection rules, filename patterns, processing defaults, resource limits, and logging configuration.
+* **legacy_integration/** — bundled validated scientific routines used by Noseboom, MIRO/Picarro, OPC, Partector, INS Gimbal, FLIR, and SIF.
+* **requirements-all.txt** — readable summary of required libraries.
+
+Keep the complete distribution folder together. The application code does not contain campaign raw data.
+
+## 3. Data-folder workflow
+
+### Flight Folder
+
+Select the flight-specific folder containing Noseboom, MIRO Rack, Hatchbox, and other flight payload deliveries. CC-FLUX scans this folder read-only.
+
+### Camera Folder
+
+Select the flight-specific "Camera_System" folder containing GoPro, FLIR, MicaSense. Camera scanning is independent from the Flight Folder scan and runs alongside it, reading GoPro first, then FLIR, then MicaSense.
+
+### Output Folder
+
+Select a writable location for processed files, plots, maps, logs, and the saved Flight Project. Never select a raw-data folder as the Output Folder.
+
+## 4. Recommended processing workflow
+
+1. Select **Flight Folder**, **Camera Folder**, and **Output Folder**.
+2. Selecting a folder does not start scanning. Click **Initial Check** when the folder selections are ready.
+3. If a Camera Folder is defined, choose **Scan Flight Only** or **Scan Flight + Camera**. Flight-only scanning keeps the Camera Folder selected for later.
+4. Review detected instruments, warnings, file counts, and UTC availability.
+5. Set the **Time Filter** using the full interval, common overlap, or a custom
+   start and end. The detected global minimum and maximum are the earliest start
+   and latest end across the flight instruments. The camera products are not
+   included: they are scanned separately and selected in Remote Sensing against
+   their own coverage.
+6. Select only the instruments that should run in **Processing Priority**.
+7. Configure instrument-specific options where a Configure button is available.
+8. Click **Start Processing**, review the health dialog, and confirm.
+9. Use **Remote Sensing** for the camera products. The button becomes available
+   only after camera scanning has finished, because until then the products'
+   coverage is not known. When the scan completes, a window reports what was
+   found and over what period. The dialog then asks which products to process
+   and over which period — the detected global minimum and maximum, the common
+   overlapping timeframe, or a custom period — and shows the request back for
+   verification before anything starts.
+10. Open an instrument card to inspect its dedicated plots, diagnostics, maps, and exports.
+11. Click **Save .ccflux** to preserve the project state.
+
+
+## 5. Instrument descriptions
+
+Each instrument is discovered from the Flight Folder or the Camera Folder by
+filename, folder name, and file content, and is reported with its own UTC
+coverage. Selecting an instrument for processing requires that its coverage
+overlaps the Time Filter.
+
+* **Noseboom** — airflow, wind components, temperature, humidity and INS/GNSS
+  navigation. Its epoch-nanosecond clock is the campaign UTC reference, and its
+  processed 1 Hz navigation is what every camera product is georeferenced
+  against. Products: 1 Hz export, straight-flight legs, wind spectra, map.
+* **MIRO** — multi-species trace gas (CO, N2O, NO, NO2, CH4, SO2, NH3, O3, CO2)
+  from the MIRO Rack. Analysed at original resolution; a separate 1 Hz copy is
+  produced for the Mapview only.
+* **Picarro** — CO2, CH4 and H2O from the MIRO Rack, delivered as `.dat` files
+  with separate DATE and TIME columns interpreted as UTC.
+* **OPC HBX-4 / HBX-5** — optical particle counters with independent bin
+  schemas. The two are kept strictly separate; a file matching both schemas is
+  reported as ambiguous and must be confirmed before processing.
+* **Partector Pro** — particle number, LDSA, mass and diagnostics.
+* **INS Gimbal** — Gremsy T3V3 attitude and inertial counts. A single Influx
+  export rotation is detected and restored to chronological order.
+* **SIF / FLOX** — AirFLOX spectral fluorescence in FULL and FLUO modes with
+  configurable corrections, position mode and vegetation indices.
+  Starting processing with SIF selected opens the settings first — modes,
+  position source, corrections and calibration files — and the run begins when
+  you save them. Progress is shown in the main window, stage by stage, and says
+  Done when it finishes. The SIF workspace opens when you click the SIF card,
+  and shows the overview, plots and maps once the products exist; it does not
+  open by itself and does not run the processing.
+  **Configure SIF** sets the same options at any time. The validated CAL_FROG calibration
+  and Indices_ICOS definitions shipped with CC-FLUX are used by default; a
+  recalibrated instrument or a different index list can be selected instead,
+  separately for FULL and FLUO, and **Use default** reverts. The chosen file is
+  checked when you select it, and the files actually used are recorded with the
+  result. **SIF Progress** shows the pipeline stage by stage while it runs.
+* **MicaSense** — multispectral imagery, discovered from TIFF or ZIP deliveries.
+  Acquisition metadata only; the detailed routines are declared unavailable.
+* **FLIR** — thermal frame export as a single large JSON stream. Selecting FLIR
+  and starting processing does the whole job: acquisition health, gaps and
+  sample frames, then the radiometric temperature conversion, then the match to
+  Noseboom navigation. There is no separate step to find and start, and the
+  temperature map is ready when the job reports complete. When more
+  than one FLIR export is present, the one whose UTC coverage overlaps the
+  analysis interval is selected and the others are reported as ignored.
+  It writes a frame index (**timestamp_index.csv**) beside its output and
+  reuses it on later runs, so the export is read once instead of on every run —
+  96 seconds saved per run on the 36 GB Flight_2707 export. The index is
+  rebuilt automatically if the export changes on disk or a different export is
+  selected.
+* **GoPro** — capture imagery. EXIF clock values are interpreted in
+  Europe/Berlin and converted to UTC during detection, then matched to the
+  nearest processed Noseboom sample within 2.5 seconds.
+
+## 6. Saving and loading a Flight Project
+
+**Save .ccflux** stores selected folders, flight identity, time-filter state, instrument configuration, processing history, completed-job state, output references, and page-specific workflow state.
+
+The project is named after its flight and written to the top of the Output Folder as `<Flight ID>.ccflux` — for example `Flight_2707.ccflux` — so that several campaign projects can sit in one folder and be told apart without being opened. It carries every file the run produced; the working folder beside it is what those files were written to, and can be deleted once the project is saved. Each save reports how many products the file holds and names anything that could not travel. A project saved by an earlier version under the fixed name, or inside a `project` folder, is moved on the next save; only one project file per flight is kept.
+
+**Load .ccflux** searches the selected location for saved projects and restores the chosen Flight Project. Raw data are not copied into the .ccflux file; the referenced input folders must remain accessible.
+
+The folder-selection window opens in front of the browser. If you do not see it, check for a Finder window behind the browser and bring it forward.
+
+## 7. Hybrid processing and project fusion
+
+Optional. A flight can be processed on one computer exactly as before; hybrid
+processing exists only to shorten a large flight by sharing it out.
+
+### On the primary computer
+
+Prepare the project as usual — folders, Initial Check, Time Filter, instrument
+settings. **Hybrid Processing** becomes available once that is complete; until
+then the button says what is still missing.
+
+The dialog asks how many worker computers there are, what each is called, and
+which computer processes each instrument. An instrument can go to one worker,
+stay on the primary, or be left out; it cannot go to two computers, because
+fusion would then have two answers for the same thing. A summary shows the
+split before anything is written.
+
+You then set a passphrase. Each worker gets a file named after the flight and
+the worker, and needs the passphrase to open it.
+
+### On a worker computer
+
+Right-click **Load .ccflux** and choose **Open a work package**, then give the
+file and the passphrase. A banner across the top of the window shows which
+worker this computer is and which instruments it was given.
+
+The flight, campaign, time range, assigned instruments and every processing
+setting come from the package and cannot be changed here — attempting it is
+refused with an explanation. The Flight, Camera and Output folders are chosen
+locally, so each computer uses its own disks.
+
+Process the assigned instruments as normal, then open the work package again
+and choose **Export results**. That writes a sealed result package containing
+the processed project, the identity it was authorised under, the processing log
+and the audit trail.
+
+### Fusion
+
+On the primary, open **Hybrid Processing** and choose **Fuse results**. Give
+between two and four result packages and the passphrase. **Check packages**
+validates them before anything is merged: same project, same flight, same time
+range, same configuration, only authorised instruments, no instrument returned
+twice, and each processed project matching its own checksum. If any check
+fails, fusion is cancelled and every reason is listed. Nothing is written until
+all of them pass.
+
+### What the security does and does not do
+
+Packages are encrypted with AES-256-GCM under a key derived from the passphrase
+with scrypt. That is authenticated encryption: the same operation that hides
+the contents also detects any change to them, so an altered package, a
+truncated one, or one assembled from two others fails to open and is refused.
+The passphrase is never written into a package. A short unencrypted header
+carries only the flight, worker and creation time, so a file can be identified
+before anyone is asked for a passphrase.
+
+This is a shared-passphrase scheme. It confines each computer to the
+instruments it was assigned and makes tampering evident. It is not a public-key
+signature: anyone holding the campaign passphrase can also create packages, so
+it does not prove which colleague produced a result. The audit trail records
+what each package claims about itself.
+
+## 8. Software updates and privacy
+
+The **Update** button reports whether a newer release has been published.
+
+* On start-up, CC-FLUX requests one small file from GitHub. If a newer version
+  exists, the button turns green and reads **Update available**, and a short
+  notice appears once.
+* Pressing the button shows the result of that start-up check, which is why it
+  opens immediately. **Check Again** in the dialog contacts GitHub again and
+  reports the outcome, so a release published while the software was running
+  can be found without restarting it. If the server cannot be reached, the
+  dialog says so rather than presenting the earlier answer as fresh.
+* **Nothing is downloaded or installed automatically.** The dialog links to
+  the release page at https://github.com/biplobforestry/CCFLUX_Software-2026. Finish any processing and save your Flight Project before
+  updating, so that a project written by one version is not reopened by another
+  part-way through a campaign.
+* If the machine is offline the check fails silently. Every function of the
+  software works without it.
+
+**What the check discloses.** Requesting that file tells the server that a
+CC-FLUX installation contacted it, along with the information any web request
+carries: the IP address it came from, the time, and the running version. No
+flight data, folder names, project contents or personal information are sent.
+
+**Switching it off.** Set the environment variable `CCFLUX_UPDATE_CHECK=off`
+before starting the launcher. The Update button then reports that the check is
+disabled and no network request is made.
+
+```bash
+CCFLUX_UPDATE_CHECK=off bash Mac_CCFLUX.command
+```
+
+## 9. Logs, troubleshooting, and safe operation
+
+* Keep the launcher window open while CC-FLUX is running.
+* Read **logs/launcher.log** when startup or library installation fails.
+* Review **Processing Log & Diagnostics** for scan and processing errors.
+* Confirm that Python 3.10 or newer is installed.
+* Confirm internet access during the first dependency installation.
+* Confirm the Output Folder is writable and separate from raw data.
+* If an external disk is slow or unavailable, select the flight-specific subfolder instead of the disk root.
+* Use **Refresh Status** to update displayed states.
+* Use **Reset System** only to clear the active GUI state. It does not delete raw input files or existing output products.
+* Use **Exit** to stop the local CC-FLUX server cleanly.
+
+## 10. Scientific responsibility
+
+Review warnings, calibration inputs, time alignment, QC information, and generated products before scientific interpretation or publication. The software assists reproducible processing but does not replace instrument-PI validation.
+
+© 2026 Biplob Dey · Forschungszentrum Jülich GmbH

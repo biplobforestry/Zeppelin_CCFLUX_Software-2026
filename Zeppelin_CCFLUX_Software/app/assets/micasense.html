@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MicaSense · CC-FLUX Campaign 2026</title>
+  <link rel="stylesheet" href="/hatchbox_science.css">
+  <style>
+    .qc-list{display:grid;gap:8px;margin:0;padding:0;list-style:none}
+    .qc-list li{padding:9px 12px;border-radius:8px;background:#0d2536;border:1px solid #2b4d63;color:#dbeaf4;font-size:.9rem}
+    .qc-list li.warn{border-color:#8a6d2b;background:#241f10;color:#f0dcae}
+    .thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+    .thumbs figure{margin:0;background:#0d2536;border:1px solid #2b4d63;border-radius:9px;overflow:hidden}
+    .thumbs img{display:block;width:100%;height:auto}
+    .thumbs figcaption{padding:7px 9px;font-size:.76rem;color:var(--muted);word-break:break-all}
+    .excluded{color:#f0dcae}
+    .plot{width:100%;height:390px}
+    .export-field{font-size:.74rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;align-self:center}
+    .top-actions select{background:#10293d;color:#edf8ff;border:1px solid #3b6480;border-radius:8px;padding:7px 9px;font:inherit;font-size:.82rem}
+    .traceability{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:0;padding:0;list-style:none}
+    .traceability li{padding:9px 12px;border-radius:8px;background:#0d2536;border:1px solid #2b4d63}
+    .traceability span{display:block;font-size:.74rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+    .traceability strong{font-size:.94rem;color:#dbeaf4;word-break:break-all}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-logo-shell"><img class="brand-logo" src="/campaign-main-airship.svg" alt="CC-FLUX 2026 airship logo"></div>
+    <div class="brand-copy"><h1>CC-FLUX Campaign 2026</h1><span class="campaign-line">A Joint CHANEL – ClimStress Zeppelin Campaign<br>Across European Cities and Forests</span><span class="review-line">Integrated Post-Flight Scientific Payload Review · MicaSense</span></div>
+    <div class="top-actions">
+      <a class="btn" href="/">Main GUI</a>
+      <label class="export-field" for="exportFormat">Export</label>
+      <select id="exportFormat" title="PDF gathers every figure into one document; PNG and SVG return the figures as a ZIP">
+        <option value="pdf" selected>PDF · all figures in one file</option>
+        <option value="png">PNG · one file per figure (ZIP)</option>
+        <option value="svg">SVG · one file per figure (ZIP)</option>
+      </select>
+      <label class="export-field" for="exportDpi">DPI</label>
+      <select id="exportDpi" title="Resolution of the exported figures">
+        <option value="150">150</option>
+        <option value="300" selected>300</option>
+        <option value="600">600</option>
+      </select>
+      <button class="btn" id="exportFiguresBtn" title="Every panel at 7 inch wide with 9 pt minimum type">Export figures</button>
+      <button class="btn" id="refreshBtn">Refresh</button>
+    </div>
+  </header>
+  <div class="status-strip"><span class="status-dot" id="statusDot"></span><span id="statusText">Reading processed MicaSense project data…</span><span class="spacer"></span><strong id="flightName">No project</strong></div>
+  <main>
+    <section class="summary-grid" id="summaryGrid"></section>
+    <section class="chart-grid">
+      <article class="chart-card wide"><div class="card-head"><h2>Acquisition quality</h2></div>
+        <ul class="qc-list" id="qcList"></ul>
+        <div class="science-note">MicaSense is read for its acquisition metadata only. Radiometry, reflectance and vegetation indices are done by the standalone MicaSense pipeline, not here.</div>
+      </article>
+      <article class="chart-card wide"><div class="card-head"><h2>Camera and light sensor</h2></div>
+        <ul class="traceability" id="traceability"></ul>
+        <div class="science-note">Read from the XMP of the band this review decodes for each capture. Nothing here is calibrated or corrected.</div>
+      </article>
+      <article class="chart-card wide"><div class="card-head"><h2>Capture integrity</h2></div>
+        <div class="plot" id="integrityPlot"></div>
+        <p class="interpretation">Every trigger by image number and what it delivered. A capture short of six bands cannot be band-aligned downstream; one with no usable acquisition time cannot be placed on the flight at all.</p>
+      </article>
+      <article class="chart-card wide"><div class="card-head"><h2>Capture cadence</h2></div>
+        <div class="plot" id="cadencePlot"></div>
+        <p class="interpretation">Seconds per trigger from the camera's boot clock, divided by the image-number gap, as the standalone MicaSense QA computes it. Dividing by the gap makes a break in the numbering read as one slow interval rather than a spike, and the boot clock keeps working when the GPS never locks. The dashed line is 1.5× the expected interval.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Flight track</h2></div>
+        <div class="plot" id="trackPlot"></div>
+        <p class="interpretation">Capture positions from image GPS, coloured by GPS altitude. Metadata positions only — no photogrammetry is performed.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Altitude</h2></div>
+        <div class="plot" id="altitudePlot"></div>
+        <p class="interpretation">GPS altitude beside the camera's barometric altitude. A steady offset between them is normal; divergence indicates one of the two drifting.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Downwelling irradiance</h2></div>
+        <div class="plot" id="irradiancePlot"></div>
+        <p class="interpretation">The DLS record of incoming light at each trigger. This is what a later reflectance conversion would divide by, so its stability bounds what that conversion can achieve.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Exposure and gain</h2></div>
+        <div class="plot" id="exposurePlot"></div>
+        <p class="interpretation">Exposure time and ISO per capture. Both moving together with irradiance is auto-exposure working; either pinned at a limit means the scene was outside the camera's range.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Light sensor orientation</h2></div>
+        <div class="plot" id="orientationPlot"></div>
+        <p class="interpretation">DLS yaw, pitch and roll in the radians the sensor writes, unconverted, so these match the standalone MicaSense overview CSV value for value. The irradiance reading assumes a level sensor, so large pitch or roll excursions are where it is least trustworthy.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Solar geometry</h2></div>
+        <div class="plot" id="solarPlot"></div>
+        <p class="interpretation">Solar elevation and azimuth exactly as the DLS recorded them, in the radians it writes and unconverted, so these match the standalone MicaSense overview CSV value for value. They should track the sun across the flight; a flat line means the sensor stopped recomputing them.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Imager temperature</h2></div>
+        <div class="plot" id="temperaturePlot"></div>
+        <p class="interpretation">Sensor body temperature per capture. Dark current rises with it, which matters for any later radiometric work.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Panchromatic image quality</h2></div>
+        <div class="plot" id="sharpnessPlot"></div>
+        <p class="interpretation">Sharpness of every tenth capture's panchromatic band: mean squared gradient normalised by the 1–99 percentile spread, so captures of different brightness are comparable. Sampled, because that band is 10 MB and a flight holds thousands. The dashed line is the bottom 5% of this flight — points below it are its softest frames, not an absolute blur limit.</p>
+      </article>
+      <article class="chart-card"><div class="card-head"><h2>Band completeness</h2></div>
+        <div class="plot" id="completenessPlot"></div>
+        <p class="interpretation">How many of the six bands each trigger delivered. A capture short of six bands cannot be band-aligned downstream.</p>
+      </article>
+      <article class="chart-card wide"><div class="card-head"><h2>Sample images</h2></div>
+        <div class="thumbs" id="thumbs"></div>
+        <p class="interpretation">One band per sampled capture, contrast-stretched between its 2nd and 98th percentile so the 16-bit scene is visible. A display stretch only: the stored counts are untouched.</p>
+      </article>
+      <article class="chart-card wide"><div class="card-head"><h2>Exported files</h2></div>
+        <ul class="qc-list" id="exportList"></ul>
+      </article>
+    </section>
+  </main>
+  <div class="busy show" id="busy"><div class="busy-card"><div class="spinner"></div><h2>Preparing MicaSense workspace</h2><p id="busyText">Loading the saved, precomputed flight products.</p></div></div>
+  <footer class="app-footer">© 2026 Biplob Dey · Forschungszentrum Jülich GmbH · <span class="app-version">Version 1.0.2</span></footer>
+  <script src="/vendor/plotly.min.js"></script><script src="/micasense.js"></script>
+</body>
+</html>

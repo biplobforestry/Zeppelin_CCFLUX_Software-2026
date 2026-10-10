@@ -1,0 +1,1630 @@
+"""Bounded MicaSense Level 1 metadata and image-integrity quick check.
+
+Capture grouping, band extraction, timestamp parsing, and completeness rules are
+adapted from the repository's ``MicaSense_Metadata.py`` and
+``MicaSense_Flight_Metadata_Audit.py``.  No radiometric or reflectance operation
+is performed here.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import re
+import threading
+import time
+import zipfile
+
+import numpy as np
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from math import degrees
+from pathlib import Path
+from statistics import median
+from typing import Any, Callable, Mapping, MutableMapping, Sequence
+from xml.etree import ElementTree
+
+from PIL import ExifTags, Image, UnidentifiedImageError
+
+from core.detector import InputCandidate
+from core.enums import DetectionStatus, ProcessingStatus
+from core.logging_manager import LogLevel, ProcessingLogManager
+from core.models import (
+    FigureArtifact,
+    InstrumentDescriptor,
+    InstrumentResult,
+    OutputFile,
+    ProgressUpdate,
+    SourceFile,
+)
+from core.resource_manager import CameraBatchPolicy, ResourceLimits
+from core.scanner import ScanIndex
+from core.time_manager import TimeRange, TimezoneState
+from instruments.base.interface import InstrumentBase, ProgressCallback
+
+EXPECTED_BANDS = frozenset({1, 2, 3, 4, 5, 6})
+# The first campaign year. A RedEdge-P whose GPS has not locked dates its frames
+# from a default clock, so anything earlier than this was not acquired when it
+# says it was. Matches the --minimum-year default of the standalone MicaSense
+# scientific overview, so the two agree on which captures are usable.
+MINIMUM_CAPTURE_YEAR = 2025
+IMAGE_SUFFIXES = frozenset({".tif", ".tiff"})
+CAPTURE_PATTERN = re.compile(r"(.+?)_(\d+)\.tiff?$", re.IGNORECASE)
+MetadataReader = Callable[[Path], Mapping[str, Any]]
+# Reading a capture's metadata means decompressing one band, because a MicaSense
+# TIFF keeps its first IFD at the end of the file. That is a disk seek and zlib,
+# both of which release the interpreter lock, so the reads overlap and the
+# useful number of readers is well above the core count. It is deliberately not
+# the CPU allocation: this is one job inside the camera group's single worker,
+# and it is waiting on the disk rather than computing.
+#
+# Measured over 600 entries of Flight_CC0806, cold: 65 entries/s read one at a
+# time, 102 with eight readers, and no faster with sixteen or thirty-two - the
+# disk is the ceiling. Warm the same slices reach 1 616 entries/s at eight and
+# 2 014 at sixteen. Sixteen therefore takes the cache-warm gain while costing
+# nothing cold, and holds sixteen archives open rather than a whole delivery.
+MICASENSE_METADATA_READERS = 16
+
+
+@dataclass(slots=True)
+class LoadedMicaSense:
+    candidate: InputCandidate
+    files: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveImage:
+    archive: Path
+    member: str
+    size_bytes: int
+    # Only one band of a capture is decompressed for its metadata. The other
+    # bands were written by the same trigger, so their acquisition time, GPS
+    # and exposure are the same; what differs between them - that the band is
+    # present, and how large it is - the archive's own file list already says.
+    # Decompressing all six cost six times the work for the same answer.
+    read_metadata: bool = True
+
+    @property
+    def name(self) -> str:
+        return Path(self.member).name
+
+
+class MicaSenseLevel1Adapter(InstrumentBase):
+    """Metadata-only RedEdge-P audit with bounded thumbnail generation."""
+
+    descriptor = InstrumentDescriptor(
+        "micasense",
+        "MicaSense Multispectral",
+        "HATCHBOX",
+        frozenset({"detection", "metadata", "quicklook", "thumbnails", "export"}),
+        True,
+    )
+
+    def __init__(
+        self,
+        *,
+        output_root: Path,
+        flight_name: str,
+        resource_limits: ResourceLimits,
+        batch_policy: CameraBatchPolicy | None = None,
+        metadata_reader: MetadataReader | None = None,
+        logger: ProcessingLogManager | None = None,
+        unusually_small_bytes: int = 64 * 1024,
+    ) -> None:
+        self.output_root = Path(output_root)
+        self.flight_name = flight_name
+        self.resource_limits = resource_limits
+        self.batch_policy = batch_policy or CameraBatchPolicy(
+            maximum_batch_files=32, maximum_thumbnail_count=24
+        )
+        self.METADATA_READERS = MICASENSE_METADATA_READERS
+        self.metadata_reader = metadata_reader or _pillow_metadata
+        self.logger = logger
+        self.unusually_small_bytes = unusually_small_bytes
+        self._callback: ProgressCallback | None = None
+        self._cancelled = threading.Event()
+        self._records: list[dict[str, Any]] = []
+        self._captures: list[dict[str, Any]] = []
+        self._capture_quality: dict[str, Any] = {}
+
+    def capture_quality(self) -> Mapping[str, Any]:
+        """Cadence, sharpness and saturation on the reference's definitions."""
+        return dict(self._capture_quality)
+
+    def capture_rows(self) -> tuple[Mapping[str, Any], ...]:
+        """One row per camera trigger, with the conditions it was taken in.
+
+        What the workspace plots. Exposed because InstrumentResult carries only
+        the summary counts, and the page needs the per-capture series.
+        """
+        return tuple(self._captures)
+
+    def detect(self, scan_index: ScanIndex) -> Sequence[InputCandidate]:
+        files = tuple(
+            entry.path
+            for entry in scan_index.entries
+            if entry.is_file and entry.path.suffix.casefold() in IMAGE_SUFFIXES
+        )
+        if not files:
+            return ()
+        matching = tuple(path for path in files if CAPTURE_PATTERN.fullmatch(path.name))
+        selected = matching or files
+        confidence = 0.98 if matching else 0.65
+        return (
+            InputCandidate(
+                "micasense",
+                selected,
+                confidence,
+                "TIFF images with repository-confirmed capture/band filename pattern",
+            ),
+        )
+
+    def inspect_metadata(self, candidate: InputCandidate) -> Mapping[str, Any]:
+        files = _all_images(candidate.paths)
+        bands = sorted(
+            {band for path in files if (band := _filename_parts(path)[1]) is not None}
+        )
+        captures = {
+            capture for path in files if (capture := _filename_parts(path)[0])
+        }
+        return {
+            "image_count": len(files),
+            "bands_identified_from_filenames": bands,
+            "capture_count_from_filenames": len(captures),
+            "expected_bands": sorted(EXPECTED_BANDS),
+            "level": "Level 1 metadata and quality control only",
+        }
+
+    def extract_time_range(self, candidate: InputCandidate) -> TimeRange:
+        values: list[datetime] = []
+        for path in _all_images(candidate.paths):
+            # One band per capture, the same rule the metadata pass follows. All
+            # six bands are written by one trigger and carry one acquisition
+            # time, so decompressing the other five tells us nothing new - and
+            # this pass was doing exactly that, 14,226 decompressions for 2,371
+            # captures, including the 10 MB panchromatic band each time. That is
+            # where MicaSense spent most of its 55 minutes on Flight_CCT0803.
+            if not getattr(path, "read_metadata", True):
+                continue
+            self._check_cancelled()
+            try:
+                value = _parse_timestamp(self._metadata(path))
+            except Exception:
+                continue
+            if value is not None:
+                values.append(value)
+        start, end = (min(values), max(values)) if values else (None, None)
+        return TimeRange(
+            start,
+            end,
+            start,
+            end,
+            TimezoneState.EXPLICIT_UTC if values else TimezoneState.UNKNOWN,
+            "EXIF DateTimeOriginal plus SubSecTime",
+            "DateTimeOriginal; FileModifyDate fallback when provided",
+        )
+
+    def validate(self, candidate: InputCandidate) -> InstrumentResult:
+        files = _all_images(candidate.paths)
+        warnings: list[str] = []
+        errors: list[str] = []
+        if not files:
+            errors.append("No MicaSense TIFF image files were selected.")
+        unparsed = [path.name for path in files if _filename_parts(path)[1] is None]
+        if unparsed:
+            warnings.append(
+                f"{len(unparsed)} image filename(s) do not expose a capture and band number."
+            )
+        coverage = self.extract_time_range(candidate) if files else TimeRange()
+        if files and coverage.utc_start is None:
+            warnings.append("No valid EXIF acquisition timestamps were extracted.")
+        status = (
+            DetectionStatus.FAILED
+            if errors
+            else DetectionStatus.WARNING
+            if warnings
+            else DetectionStatus.READY
+        )
+        return InstrumentResult(
+            "micasense",
+            self.descriptor.display_name,
+            "HATCHBOX",
+            status,
+            source_files=_image_sources(files),
+            file_count=len(files),
+            original_start_time=coverage.original_start,
+            original_end_time=coverage.original_end,
+            utc_start_time=coverage.utc_start,
+            utc_end_time=coverage.utc_end,
+            warnings=warnings,
+            errors=errors,
+            metadata=dict(self.inspect_metadata(candidate)),
+        )
+
+    def load(self, candidate: InputCandidate) -> LoadedMicaSense:
+        validation = self.validate(candidate)
+        if validation.errors:
+            raise ValueError("; ".join(validation.errors))
+        self._emit(2, "MicaSense files validated")
+        return LoadedMicaSense(candidate, _all_images(candidate.paths))
+
+    def _read_group(
+        self, files: Sequence[Any], indices: Sequence[int]
+    ) -> list[dict[str, Any]]:
+        """Read one archive's bands on one worker, then give its handle back.
+
+        Closing here rather than at the end of the pass is what keeps the count
+        of open archives equal to the number of workers. A thread-local handle
+        left behind survives until the thread does, and on Windows an archive
+        still held open is an archive the next stage cannot move or delete.
+        """
+        try:
+            return [self._inspect_one(files[index]) for index in indices]
+        finally:
+            release_archive_handle()
+
+    def process_quicklook(
+        self, loaded: LoadedMicaSense, options: Mapping[str, Any]
+    ) -> InstrumentResult:
+        started = time.monotonic()
+        files = loaded.files
+        self._records = []
+        corrupt: list[str] = []
+        small: list[str] = []
+        # One pool for the whole delivery, not one per batch of 32. Each batch
+        # was a barrier: the pool was built, its files read, then every worker
+        # waited for the slowest before the next batch began, 1 865 times over
+        # Flight_CC0806's 59 667 images. Removing it measured 27% faster once
+        # the cache was warm and made no difference cold, where the disk sets
+        # the pace either way. In-flight files are bounded by the number of
+        # readers rather than by the batch, so the memory ceiling is unchanged.
+        groups = _reading_groups(files)
+        workers = max(1, min(self.METADATA_READERS, len(groups)))
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="ccflux-micasense-meta"
+        ) as executor:
+            reading = [executor.submit(self._read_group, files, group)
+                       for group in groups]
+            completed = announced = 0
+            try:
+                for group, future in zip(groups, reading):
+                    self._check_cancelled()
+                    for index, record in zip(group, future.result()):
+                        self._records.append(record)
+                        if record["corrupt"]:
+                            corrupt.append(files[index].name)
+                        if record["unusually_small"]:
+                            small.append(files[index].name)
+                    completed += len(group)
+                    if completed - announced >= 200 or completed == len(files):
+                        announced = completed
+                        self._emit(
+                            5 + 70 * completed / max(1, len(files)),
+                            f"Reading capture metadata: "
+                            f"{completed:,}/{len(files):,} images",
+                        )
+            except BaseException:
+                # Leaving the pool otherwise waits for every queued capture, so
+                # a cancelled delivery would keep reading for minutes after the
+                # operator asked it to stop.
+                for future in reading:
+                    future.cancel()
+                raise
+
+        self._share_capture_metadata()
+        # Every instrument processes only what falls inside the operator's
+        # selected interval. MicaSense previously evaluated the whole delivery
+        # regardless of the Time Filter, so its capture counts and completeness
+        # did not describe the same flight window as every other instrument.
+        selected_start = _as_utc(options.get("analysis_start"))
+        selected_end = _as_utc(options.get("analysis_end"))
+        # A capture dated before the campaign was dated by a camera whose GPS had
+        # not locked, so it carries a default clock rather than an acquisition
+        # time. Those frames are dropped from every calculation - coverage,
+        # capture grouping, trigger cadence and the plotted series - and reported
+        # instead. Keeping them made MicaSense claim it recorded from 1970 and
+        # put a 56-year gap in the trigger intervals.
+        pre_campaign = [
+            record for record in self._records
+            if (stamp := _as_utc(record.get("timestamp"))) is not None
+            and stamp.year < MINIMUM_CAPTURE_YEAR
+        ]
+        if pre_campaign:
+            dropped = {id(record) for record in pre_campaign}
+            self._records = [
+                record for record in self._records if id(record) not in dropped
+            ]
+        # The delivery's own coverage, from every dated capture, before the Time
+        # Filter narrows anything. Discovery can only estimate this from a
+        # bounded sample of the archives; a run has read them all, so this is
+        # what replaces the estimate on the instrument card afterwards.
+        delivered = [
+            stamp
+            for record in self._records
+            if (stamp := _as_utc(record.get("timestamp"))) is not None
+        ]
+        delivered_start = min(delivered) if delivered else None
+        delivered_end = max(delivered) if delivered else None
+        excluded_by_time = 0
+        undated = 0
+        if selected_start is not None or selected_end is not None:
+            selected_records = []
+            for record in self._records:
+                stamp = _as_utc(record.get("timestamp"))
+                if stamp is None:
+                    # An image with no usable acquisition time cannot be placed
+                    # in the flight; keep it and say so rather than silently
+                    # assuming it belongs.
+                    undated += 1
+                    selected_records.append(record)
+                    continue
+                if (selected_start is not None and stamp < selected_start) or (
+                    selected_end is not None and stamp > selected_end
+                ):
+                    excluded_by_time += 1
+                    continue
+                selected_records.append(record)
+            if not selected_records:
+                raise ValueError(
+                    "No MicaSense image falls inside the selected Time Filter "
+                    f"({_iso(selected_start)} to {_iso(selected_end)} UTC)."
+                )
+            self._records = selected_records
+
+        self._captures = _capture_rows(self._records)
+        # Panchromatic quality on every tenth capture, as the reference samples
+        # it. Bounded on purpose: band 6 is 10 MB and a flight has thousands.
+        self._emit(76, "Sampling panchromatic sharpness and saturation")
+        sharpness_samples = _sample_panchromatic_quality(
+            self._captures, check_cancelled=self._check_cancelled
+        )
+        release_archive_handle()
+        # No expected interval unless the operator states one, so the warning
+        # line follows this camera. The reference's CLI defaults it to 2.5 s,
+        # which on Flight_CCT0803 - triggering every 6.26 s - put 229 of 237
+        # intervals past the threshold and reported a steady camera as almost
+        # entirely late. target falls back to the measured median, which is what
+        # make_dashboard does whenever the argument is absent.
+        expected = options.get("expected_interval_seconds")
+        self._capture_quality = _capture_quality_summary(
+            self._captures, None if expected is None else float(expected)
+        )
+        complete = sum(row["complete"] for row in self._captures)
+        incomplete = len(self._captures) - complete
+        timestamps = [
+            record["timestamp"]
+            for record in self._records
+            if record["timestamp"] is not None
+        ]
+        # A camera powered up without a clock write dates its frames from the
+        # epoch, and 24 of Flight_CCT0803's carry such a stamp. Including them
+        # in the reported coverage made MicaSense claim it recorded from
+        # 1970-01-01, which is 56 years of coverage for a four-hour flight. They
+        # are still counted and warned about below; they just cannot bound a
+        # window they were never placed in.
+        trigger_intervals = _trigger_intervals(self._captures)
+        thumbnail_paths = self._create_limited_thumbnails(files)
+        warnings = []
+        if incomplete:
+            warnings.append(f"{incomplete} incomplete capture(s) detected.")
+        if corrupt:
+            warnings.append(f"{len(corrupt)} corrupt or unreadable TIFF file(s) detected.")
+        if small:
+            warnings.append(f"{len(small)} unusually small TIFF file(s) detected.")
+        if excluded_by_time:
+            warnings.append(
+                f"{excluded_by_time} image(s) outside the selected Time Filter "
+                "were excluded from this evaluation."
+            )
+        if undated:
+            warnings.append(
+                f"{undated} image(s) have no usable acquisition time — the EXIF "
+                "timestamp is missing or the camera clock was not set — and were "
+                "retained without time filtering. They cannot be placed on the "
+                "flight timeline."
+            )
+        missing_gps = sum(not record["gps_present"] for record in self._records)
+        missing_exposure = sum(not record["exposure_present"] for record in self._records)
+        if missing_gps:
+            warnings.append(f"GPS metadata missing from {missing_gps} image(s).")
+        if missing_exposure:
+            warnings.append(f"Exposure metadata missing from {missing_exposure} image(s).")
+        static_solar = _static_solar_geometry_warning(self._captures)
+        if static_solar:
+            warnings.append(static_solar)
+        if pre_campaign:
+            warnings.append(
+                f"{len(pre_campaign)} image(s) are dated before "
+                f"{MINIMUM_CAPTURE_YEAR}, which means the camera GPS had not "
+                "locked and the frame carries a default clock rather than an "
+                "acquisition time. They are excluded from the coverage, capture "
+                "grouping, trigger cadence and every plot; the images "
+                "themselves are untouched on the delivery."
+            )
+        status = ProcessingStatus.WARNING if warnings else ProcessingStatus.COMPLETE
+        result = InstrumentResult(
+            "micasense",
+            self.descriptor.display_name,
+            "HATCHBOX",
+            DetectionStatus.WARNING if warnings else DetectionStatus.READY,
+            status,
+            _image_sources(files),
+            len(files),
+            min(timestamps) if timestamps else None,
+            max(timestamps) if timestamps else None,
+            min(timestamps) if timestamps else None,
+            max(timestamps) if timestamps else None,
+            completeness_percentage=(
+                100.0 * complete / len(self._captures) if self._captures else None
+            ),
+            warnings=warnings,
+            progress=100.0,
+            figures=[
+                FigureArtifact(path, "MicaSense Level 1 thumbnail")
+                for path in thumbnail_paths
+            ],
+            metadata={
+                "level": 1,
+                # The counts describe what was evaluated, which is the delivery
+                # narrowed to the Time Filter. Counting every delivered file
+                # here reported 14,226 images beside 42 captures of 6 bands.
+                "image_count": len(self._records),
+                "delivered_image_count": len(files),
+                # Measured over the whole delivery, not the filtered selection.
+                "delivered_utc_start": _iso(delivered_start),
+                "delivered_utc_end": _iso(delivered_end),
+                "capture_count": len(self._captures),
+                "complete_capture_count": complete,
+                "incomplete_capture_count": incomplete,
+                "bands": sorted(
+                    {
+                        record["band_number"]
+                        for record in self._records
+                        if record["band_number"] is not None
+                    }
+                ),
+                "trigger_intervals_seconds": trigger_intervals,
+                "median_trigger_interval_seconds": (
+                    median(trigger_intervals) if trigger_intervals else None
+                ),
+                "gps_present_count": len(self._records) - missing_gps,
+                "exposure_present_count": len(self._records) - missing_exposure,
+                "corrupt_files": corrupt,
+                "unusually_small_files": small,
+                "thumbnail_count": len(thumbnail_paths),
+                "camera_identity": _camera_identity(self._records),
+                # The reference dashboard's derived metrics, on its definitions,
+                # so a number here and a number in its summary JSON agree.
+                **{
+                    key: value
+                    for key, value in self._capture_quality.items()
+                    if key != "normalised_intervals"
+                },
+                "sharpness_sampled_captures": sharpness_samples,
+                # How many images were being read at once. It replaces the old
+                # batch size, which described a barrier that no longer exists;
+                # this is the real ceiling on files in flight, and so on memory.
+                "metadata_readers": min(self.METADATA_READERS, max(1, len(files))),
+                "cpu_limit": self.resource_limits.worker_count,
+                "ram_limit_bytes": self.resource_limits.memory_bytes,
+                "excluded_operations": [
+                    "radiometric correction",
+                    "panel calibration",
+                    "band alignment",
+                    "reflectance conversion",
+                    "vegetation indices",
+                    "georeferencing",
+                ],
+            },
+            elapsed_time=timedelta(seconds=time.monotonic() - started),
+        )
+        self._emit(100, "MicaSense Level 1 quick check complete")
+        if self.logger:
+            self.logger.log(
+                LogLevel.WARNING if warnings else LogLevel.SUCCESS,
+                "micasense-level1",
+                "MicaSense Level 1 quick check completed",
+                instrument="micasense",
+                processing_step="metadata-qc",
+            )
+        return result
+
+    def process_detailed(self, loaded: Any, options: Mapping[str, Any]) -> InstrumentResult:
+        """MicaSense is read for its metadata only, by decision.
+
+        Reflectance and index work belongs to the standalone MicaSense pipeline
+        and is not run here, so no job offers this stage; the review software
+        reports what the camera recorded and how complete the captures are.
+        """
+        raise NotImplementedError(
+            "MicaSense is processed for acquisition metadata only. Reflectance "
+            "and vegetation index work is done by the standalone MicaSense "
+            "pipeline, not by the payload review software."
+        )
+
+    def create_plots(
+        self, result: InstrumentResult, output_directory: Path
+    ) -> Sequence[FigureArtifact]:
+        self._assert_output(output_directory)
+        return tuple(result.figures)
+
+    def export_results(
+        self,
+        result: InstrumentResult,
+        output_directory: Path,
+        formats: Sequence[str],
+    ) -> Sequence[OutputFile]:
+        self._assert_output(output_directory)
+        requested = {value.casefold() for value in formats}
+        if requested - {"csv", "json"}:
+            raise ValueError("MicaSense Level 1 exports support CSV and JSON")
+        output_directory.mkdir(parents=True, exist_ok=True)
+        outputs: list[OutputFile] = []
+        if "csv" in requested:
+            for name, rows in (
+                ("image_metadata_qc.csv", self._records),
+                ("capture_completeness_qc.csv", self._captures),
+            ):
+                path = output_directory / name
+                _reject_existing(path)
+                _write_csv(path, rows)
+                outputs.append(OutputFile(path, "micasense_level1_csv", "text/csv", path.stat().st_size))
+        if "json" in requested:
+            path = output_directory / "level1_summary.json"
+            _reject_existing(path)
+            path.write_text(
+                json.dumps(result.metadata, indent=2, default=str), encoding="utf-8"
+            )
+            outputs.append(OutputFile(path, "micasense_level1_summary", "application/json", path.stat().st_size))
+        result.output_files.extend(outputs)
+        return tuple(outputs)
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def report_progress(self, callback: ProgressCallback | None) -> None:
+        self._callback = callback
+
+    def _share_capture_metadata(self) -> None:
+        """Give every band of a capture the metadata its read band carries.
+
+        The bands of one capture were written by a single trigger, so they
+        share an acquisition time, a position and an exposure. Reading one and
+        sharing it costs a sixth of the decompression and reports the same
+        thing; only presence and size, which come from the archive's file list,
+        differ between them.
+        """
+        read: dict[str, Mapping[str, Any]] = {}
+        for record in self._records:
+            if not record.get("listed_only") and record.get("_filename_capture"):
+                read.setdefault(str(record["_filename_capture"]), record)
+        for record in self._records:
+            if not record.get("listed_only"):
+                continue
+            source = read.get(str(record.get("_filename_capture")))
+            if source is None:
+                continue
+            # The capture id too: the read band takes it from EXIF, and a
+            # listed band that kept its filename id would land in a capture of
+            # its own, leaving every capture looking incomplete.
+            for field in (
+                "capture_id", "timestamp", "gps_present", "gps_latitude",
+                "gps_longitude", "gps_altitude", "exposure_present",
+                "exposure_time", "iso_speed", "gps_dop",
+                *(_qa_record_key(name) for name in NUMERIC_QA_FIELDS),
+            ):
+                record[field] = source[field]
+
+    def _inspect_one(self, path: Any) -> dict[str, Any]:
+        capture_id, band = _filename_parts(path)
+        corrupt = False
+        metadata: Mapping[str, Any] = {}
+        if isinstance(path, ArchiveImage) and not path.read_metadata:
+            # A band whose capture is read elsewhere. Its presence and its size
+            # come from the archive's file list, which needs no decompression;
+            # its acquisition metadata is filled in from the capture below.
+            size = _asset_size(path)
+            return {
+                "source_file": _asset_source(path),
+                "file_name": path.name,
+                "capture_id": capture_id,
+                "band_number": band,
+                "band_name": None,
+                "timestamp": None,
+                "gps_present": None,
+                "gps_latitude": None,
+                "gps_longitude": None,
+                "gps_altitude": None,
+                "exposure_present": None,
+                "exposure_time": None,
+                "iso_speed": None,
+                "gps_dop": None,
+                **{_qa_record_key(name): None for name in NUMERIC_QA_FIELDS},
+                **{key: None for key in TRACEABILITY_FIELDS.values()},
+                "size_bytes": size,
+                "unusually_small": size < self.unusually_small_bytes,
+                "corrupt": False,
+                "listed_only": True,
+                "_filename_capture": capture_id,
+            }
+        try:
+            # Decompress the band once and share it, rather than paying for it
+            # again in verification.
+            payload = (
+                _archive_member_bytes(path)
+                if isinstance(path, ArchiveImage)
+                else None
+            )
+            metadata = self._metadata(path, payload)
+            _verify_image(path, payload)
+        except (
+            OSError, ValueError, KeyError, zipfile.BadZipFile,
+            UnidentifiedImageError,
+        ):
+            corrupt = True
+        size = _asset_size(path)
+        timestamp = _parse_timestamp(metadata)
+        return {
+            "source_file": _asset_source(path),
+            "file_name": path.name,
+            "capture_id": metadata.get("CaptureId") or capture_id,
+            "band_number": _integer(metadata.get("BandNumber")) or band,
+            "band_name": metadata.get("BandName"),
+            "timestamp": timestamp,
+            "gps_present": _gps_present(metadata),
+            "gps_latitude": metadata.get("GPSLatitude"),
+            "gps_longitude": metadata.get("GPSLongitude"),
+            "gps_altitude": metadata.get("GPSAltitude"),
+            "exposure_present": metadata.get("ExposureTime") is not None,
+            "exposure_time": metadata.get("ExposureTime"),
+            "iso_speed": metadata.get("ISOSpeed"),
+            "gps_dop": _optional_number(metadata.get("GPSDOP")),
+            **_qa_fields(metadata),
+            **{
+                key: (str(metadata.get(name)) if metadata.get(name) else None)
+                for name, key in TRACEABILITY_FIELDS.items()
+            },
+            "size_bytes": size,
+            "unusually_small": size < self.unusually_small_bytes,
+            "corrupt": corrupt,
+            "listed_only": False,
+            "_filename_capture": capture_id,
+        }
+
+    def _create_limited_thumbnails(self, files: tuple[Any, ...]) -> list[Path]:
+        limit = min(self.batch_policy.maximum_thumbnail_count, len(files))
+        if not limit:
+            return []
+        directory = self.output_root / "thumbnails"
+        directory.mkdir(parents=True, exist_ok=True)
+        indexes = sorted({round(index * (len(files) - 1) / max(1, limit - 1)) for index in range(limit)})
+        outputs: list[Path] = []
+        bytes_written = 0
+        for index in indexes:
+            self._check_cancelled()
+            source = files[index]
+            target = directory / f"{Path(source.name).stem}_thumbnail.jpg"
+            if target.exists():
+                raise FileExistsError(f"MicaSense thumbnail already exists: {target}")
+            try:
+                _save_thumbnail(source, target)
+                bytes_written += target.stat().st_size
+                if bytes_written > self.batch_policy.maximum_thumbnail_bytes:
+                    target.unlink(missing_ok=True)
+                    break
+                outputs.append(target)
+            except (
+                OSError, ValueError, KeyError, zipfile.BadZipFile,
+                UnidentifiedImageError,
+            ):
+                continue
+        return outputs
+
+    def _metadata(
+        self, source: Any, payload: bytes | None = None
+    ) -> Mapping[str, Any]:
+        if isinstance(source, ArchiveImage):
+            return _archive_metadata(source, payload)
+        return self.metadata_reader(source)
+
+    def _emit(self, progress: float, phase: str) -> None:
+        self._check_cancelled()
+        if self._callback:
+            self._callback(ProgressUpdate("micasense", progress, phase, phase))
+
+    def _check_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            if self.logger:
+                self.logger.log(
+                    LogLevel.WARNING,
+                    "micasense-level1",
+                    "MicaSense Level 1 quick check cancelled",
+                    instrument="micasense",
+                )
+            raise RuntimeError("MicaSense Level 1 processing was cancelled")
+
+    def _assert_output(self, path: Path) -> None:
+        root = self.output_root.resolve(strict=False)
+        target = Path(path).resolve(strict=False)
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"MicaSense output must remain below {root}") from exc
+
+
+def _image_files(paths: Sequence[Path]) -> tuple[Path, ...]:
+    return tuple(
+        sorted(
+            (
+                Path(path)
+                for path in paths
+                if Path(path).is_file()
+                and Path(path).suffix.casefold() in IMAGE_SUFFIXES
+                and not _is_apple_double(path)
+            ),
+            key=lambda path: str(path).casefold(),
+        )
+    )
+
+
+# Panchromatic image quality, ported from micasense_postflight_qa.py so the two
+# report the same number. Sharpness is the mean squared gradient normalised by
+# the 1-99 percentile spread, which makes it comparable between captures of
+# different brightness; dark and saturated fractions are measured against the
+# band's own recorded black level. Decimated 4x in each direction for speed, as
+# the reference does - the edges that matter for relative blur survive it.
+SHARPNESS_SAMPLE_STEP = 10
+SHARPNESS_DECIMATION = 4
+SATURATION_WHITE_LEVEL = 65535.0
+
+
+def _sharpness_and_exposure(data: bytes) -> dict[str, float]:
+    """The reference implementation's panchromatic QA, on one band's bytes."""
+    import numpy as np
+
+    with Image.open(io.BytesIO(data)) as image:
+        array = np.asarray(image, dtype=np.float32)
+        sample = array[::SHARPNESS_DECIMATION, ::SHARPNESS_DECIMATION]
+        p01, p99 = np.percentile(sample, [1, 99])
+        dynamic = max(float(p99 - p01), 1.0)
+        gx = np.diff(sample, axis=1)
+        gy = np.diff(sample, axis=0)
+        sharpness = float((np.mean(gx * gx) + np.mean(gy * gy)) / (dynamic * dynamic))
+        black_value = image.tag_v2.get(50714, 0)
+        if isinstance(black_value, (tuple, list)):
+            black_value = median(float(value) for value in black_value)
+        black_value = float(black_value or 0)
+        dark_limit = black_value + 0.01 * (SATURATION_WHITE_LEVEL - black_value)
+        return {
+            "sharpness": sharpness,
+            "dark_fraction": float(np.mean(sample <= dark_limit)),
+            "saturated_fraction": float(
+                np.mean(sample >= 0.99 * SATURATION_WHITE_LEVEL)
+            ),
+            "p01": float(p01),
+            "p50": float(np.median(sample)),
+            "p99": float(p99),
+        }
+
+
+# The reference's image_number(): the number after IMG_, from the file or archive
+# name. Deliberately not "the first digits in the string" - the XMP CaptureId is
+# a random token like mxPsuh847qgEuwZespyY, and reading digits out of it returned
+# 847 for that capture and 0 for others, which collapsed the image-number axis
+# and left 13 usable intervals out of 238.
+CAPTURE_NUMBER_RE = re.compile(r"IMG_(\d+)", re.IGNORECASE)
+
+
+def _capture_number(*candidates: object) -> int | None:
+    """IMG_0294 -> 294. The reference keys its sampling and its x axis on this."""
+    for value in candidates:
+        match = CAPTURE_NUMBER_RE.search(str(value or ""))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _is_apple_double(path: Any) -> bool:
+    """A macOS resource-fork stub, not a delivery.
+
+    Copying a MicaSense folder through a non-HFS volume leaves a 4 KB
+    "._IMG_0000.zip" beside each real archive. It is an AppleDouble file, not a
+    ZIP, so opening it raised BadZipFile and the capture was reported as a
+    corrupt archive - two false "corrupt or unreadable" warnings on
+    Flight_CCT0803, on a delivery where nothing was wrong.
+    """
+    return Path(getattr(path, "name", str(path))).name.startswith("._")
+
+
+def _all_images(paths: Sequence[Path]) -> tuple[Any, ...]:
+    images: list[Any] = list(_image_files(paths))
+    archives: list[Path] = []
+    for value in paths:
+        path = Path(value)
+        if path.is_dir():
+            archives.extend(path.rglob("*.zip"))
+        elif path.is_file() and path.suffix.casefold() == ".zip":
+            archives.append(path)
+    archives = [archive for archive in archives if not _is_apple_double(archive)]
+    for archive in sorted(dict.fromkeys(archives), key=lambda item: str(item).casefold()):
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                members = [
+                    info for info in bundle.infolist()
+                    if not info.is_dir()
+                    and Path(info.filename).suffix.casefold() in IMAGE_SUFFIXES
+                ]
+                # Band 1 carries the metadata for the capture; where a delivery
+                # has no band 1, the first member stands in for it.
+                metadata_member = next(
+                    (
+                        info for info in members
+                        if _filename_parts(Path(info.filename))[1] == 1
+                    ),
+                    members[0] if members else None,
+                )
+                for info in members:
+                    images.append(
+                        ArchiveImage(
+                            archive,
+                            info.filename,
+                            info.file_size,
+                            read_metadata=info is metadata_member,
+                        )
+                    )
+        except (OSError, zipfile.BadZipFile):
+            images.append(ArchiveImage(archive, "__CORRUPT_ARCHIVE__.tif", 0))
+    return tuple(images)
+
+
+def _reading_groups(files: Sequence[Any]) -> list[list[int]]:
+    """The units of parallel work: one archive's bands stay on one worker.
+
+    _open_archive holds one handle per thread and closes it the moment that
+    thread is handed a member of a different archive. Submitting the delivery
+    file by file scatters a capture's six bands over six workers, so every band
+    pays its own central-directory read — the cost the handle cache exists to
+    avoid. Grouping keeps one open per capture and still runs the captures
+    alongside each other.
+
+    On this machine the two schedules measured the same, within a few per cent
+    either way, because the disk is the ceiling. The invariant is what matters:
+    the delivery that made the cache worth building was read over USB at 1.2 s
+    per band, and per-file scheduling would quietly undo it there.
+
+    Loose images own no handle to reuse, so each is its own unit.
+    """
+    groups: list[list[int]] = []
+    grouping: Path | None = None
+    for index, item in enumerate(files):
+        archive = getattr(item, "archive", None)
+        if archive is not None and archive == grouping:
+            groups[-1].append(index)
+            continue
+        groups.append([index])
+        grouping = archive
+    return groups
+
+
+def _filename_parts(path: Any) -> tuple[str | None, int | None]:
+    match = CAPTURE_PATTERN.fullmatch(path.name)
+    return (match.group(1), int(match.group(2))) if match else (None, None)
+
+
+def _pillow_metadata(path: Path) -> Mapping[str, Any]:
+    with Image.open(path) as image:
+        exif = image.getexif()
+        result = {
+            ExifTags.TAGS.get(tag, str(tag)): value for tag, value in exif.items()
+        }
+        result.update(
+            {
+                key: value
+                for key, value in image.info.items()
+                if isinstance(value, (str, int, float))
+            }
+        )
+        return result
+
+
+_ARCHIVE_HANDLES = threading.local()
+
+
+def _open_archive(archive: Path) -> zipfile.ZipFile:
+    """Reuse this thread's handle when consecutive members share an archive.
+
+    A MicaSense capture is one archive holding a band per file. Metadata and
+    verification each used to open the archive from scratch, so a six-band
+    capture paid twelve central-directory reads over USB. Measured on the
+    campaign disk that was 1.2 s per band — 64 minutes for 3,216 bands.
+
+    The handle is kept in thread-local storage because ZipFile is not safe for
+    concurrent reads, and the inspection pool maps several bands at once.
+    Members arrive sorted, so each worker sees runs from the same archive.
+    """
+    cached = getattr(_ARCHIVE_HANDLES, "handle", None)
+    if cached is not None and getattr(_ARCHIVE_HANDLES, "path", None) == archive:
+        return cached
+    if cached is not None:
+        try:
+            cached.close()
+        except OSError:
+            pass
+    handle = zipfile.ZipFile(archive)
+    _ARCHIVE_HANDLES.handle = handle
+    _ARCHIVE_HANDLES.path = archive
+    return handle
+
+
+def release_archive_handle() -> None:
+    """Close this thread's cached archive handle."""
+    cached = getattr(_ARCHIVE_HANDLES, "handle", None)
+    if cached is not None:
+        try:
+            cached.close()
+        except OSError:
+            pass
+    _ARCHIVE_HANDLES.handle = None
+    _ARCHIVE_HANDLES.path = None
+
+
+def _archive_member_bytes(source: ArchiveImage) -> bytes:
+    """Decompress a band once; metadata and verification then share the buffer."""
+    return _open_archive(source.archive).read(source.member)
+
+
+def _archive_metadata(source: ArchiveImage, payload: bytes | None = None) -> Mapping[str, Any]:
+    data = _archive_member_bytes(source) if payload is None else payload
+    with Image.open(io.BytesIO(data)) as image:
+        return _metadata_from_image(image)
+
+
+def _metadata_from_image(image: Image.Image) -> Mapping[str, Any]:
+    exif = image.getexif()
+    result = {ExifTags.TAGS.get(tag, str(tag)): value for tag, value in exif.items()}
+    try:
+        for tag, value in exif.get_ifd(ExifTags.IFD.Exif).items():
+            name = ExifTags.TAGS.get(tag, str(tag))
+            result[name] = value
+            if name == "SubsecTime":
+                result["SubSecTime"] = value
+    except (KeyError, TypeError):
+        pass
+    try:
+        gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+        latitude = _gps_decimal(gps.get(2), gps.get(1))
+        longitude = _gps_decimal(gps.get(4), gps.get(3))
+        if latitude is not None:
+            result["GPSLatitude"] = latitude
+        if longitude is not None:
+            result["GPSLongitude"] = longitude
+        if gps.get(6) is not None:
+            result["GPSAltitude"] = float(gps[6])
+        if gps.get(11) is not None:
+            result["GPSDOP"] = float(gps[11])
+    except (KeyError, TypeError, ValueError):
+        pass
+    xmp = image.info.get("xmp")
+    if isinstance(xmp, bytes):
+        result.update(_xmp_metadata(xmp))
+    result.update({
+        key: value for key, value in image.info.items()
+        if isinstance(value, (str, int, float))
+    })
+    return result
+
+
+def _gps_decimal(value: Any, reference: Any) -> float | None:
+    if not isinstance(value, (tuple, list)) or len(value) != 3:
+        return None
+    decimal = float(value[0]) + float(value[1]) / 60 + float(value[2]) / 3600
+    return -decimal if str(reference).upper() in {"S", "W"} else decimal
+
+
+# What the camera records about the conditions it recorded in. All of it is
+# metadata already decoded while reading the band, so keeping it costs no extra
+# read; discarding it was what left the workspace with nothing to plot.
+# Wavelengths and irradiances are the camera's own values, unmodified.
+XMP_QA_FIELDS = (
+    "Irradiance",
+    "SpectralIrradiance",
+    "HorizontalIrradiance",
+    "DirectIrradiance",
+    "ScatteredIrradiance",
+    "IrradianceYaw",
+    "IrradiancePitch",
+    "IrradianceRoll",
+    "Yaw",
+    "Pitch",
+    "Roll",
+    "SolarElevation",
+    "SolarAzimuth",
+    "ImagerTemperatureC",
+    "PressureAlt",
+    "BootTimestamp",
+    "GPSXYAccuracy",
+    "GPSZAccuracy",
+    "FlightId",
+    "Serial",
+    "SwVersion",
+    "RigName",
+)
+
+
+# The subset that is a number and worth a series. FlightId, Serial, SwVersion
+# and RigName are traceability strings and are reported once, not plotted.
+NUMERIC_QA_FIELDS = (
+    # The reference derives cadence from BootTimestamp rather than the EXIF
+    # clock, because a camera whose GPS never locked still counts seconds since
+    # power-on correctly.
+    "BootTimestamp",
+    "Irradiance",
+    "SpectralIrradiance",
+    "HorizontalIrradiance",
+    "DirectIrradiance",
+    "ScatteredIrradiance",
+    "IrradianceYaw",
+    "IrradiancePitch",
+    "IrradianceRoll",
+    "SolarElevation",
+    "SolarAzimuth",
+    "ImagerTemperatureC",
+    "PressureAlt",
+    "GPSXYAccuracy",
+    "GPSZAccuracy",
+)
+# The camera writes solar geometry and its own attitude in radians.
+# A frozen solar-geometry reading only shows up over a long enough span: over
+# ten minutes the sun really does barely move.
+STATIC_SOLAR_MIN_HOURS = 1.0
+STATIC_SOLAR_MAX_SPREAD_DEG = 1.0
+
+# Nothing here is converted. The standalone micasense_scientific_overview.py is
+# the reference for this delivery and it stores every one of these raw -
+# as_float(xmp.get(...)) and no arithmetic - so a value on this page and the
+# same value in its CSV are the same number, and a cross-check between them
+# means something.
+#
+# The units are the camera's own and they are not uniform: the DLS attitude is
+# degrees (yaw runs -27 to +32, roll reaches 89 across Flight_CCT0803) while
+# solar geometry is radians (SolarElevation 0.9744, which is 55.8 degrees, right
+# for 13:00 local in August at 51.4 N). Converting the attitude as radians put
+# yaw at +/-2000 degrees on the plot; converting solar geometry to degrees
+# disagreed with the reference CSV. Each axis states its own unit instead.
+RADIANS_AS_RECORDED = frozenset({"SolarElevation", "SolarAzimuth"})
+
+
+# Which camera and light sensor produced the delivery. Reported once rather than
+# plotted, and worth reporting: a mid-campaign sensor swap or firmware change is
+# invisible in the imagery but decides whether two flights are comparable.
+TRACEABILITY_FIELDS = {
+    "RigName": "rig_name",
+    "Serial": "dls_serial",
+    "SwVersion": "dls_software",
+    "FlightId": "flight_id",
+}
+
+# Names the split-on-capitals rule gets wrong: runs of capitals are one word.
+QA_KEY_OVERRIDES = {
+    "GPSXYAccuracy": "gps_xy_accuracy",
+    "GPSZAccuracy": "gps_z_accuracy",
+    "ImagerTemperatureC": "imager_temperature_c",
+    # The names micasense_scientific_overview.py uses, so a column here and a
+    # column there are the same column.
+    "IrradianceYaw": "dls_yaw",
+    "IrradiancePitch": "dls_pitch",
+    "IrradianceRoll": "dls_roll",
+    "Irradiance": "dls_irradiance",
+    "SpectralIrradiance": "dls_spectral_irradiance",
+    "HorizontalIrradiance": "dls_horizontal_irradiance",
+    "DirectIrradiance": "dls_direct_irradiance",
+    "ScatteredIrradiance": "dls_scattered_irradiance",
+}
+
+
+def _qa_record_key(name: str) -> str:
+    """CamelCase XMP name to the snake_case record field, degrees noted."""
+    snake = QA_KEY_OVERRIDES.get(name)
+    if snake is None:
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    return snake
+
+
+def _optional_number(value: Any) -> float | None:
+    """A float, or None. XMP values arrive as text and may be absent."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    return number
+
+
+def _qa_fields(metadata: Mapping[str, Any]) -> dict[str, float | None]:
+    """The camera's own QA values, exactly as recorded."""
+    result: dict[str, float | None] = {}
+    for name in NUMERIC_QA_FIELDS:
+        result[_qa_record_key(name)] = _optional_number(metadata.get(name))
+    return result
+
+
+def _xmp_metadata(payload: bytes) -> dict[str, Any]:
+    try:
+        root = ElementTree.fromstring(payload.decode("utf-8", errors="ignore"))
+    except ElementTree.ParseError:
+        return {}
+    values: dict[str, Any] = {}
+    for element in root.iter():
+        local = element.tag.rsplit("}", 1)[-1]
+        text = (element.text or "").strip()
+        if not text:
+            continue
+        if local in {"BandName", "CaptureId", "CentralWavelength", "WavelengthFWHM"}:
+            key = {
+                "CentralWavelength": "CenterWavelength",
+                "WavelengthFWHM": "Bandwidth",
+            }.get(local, local)
+            values[key] = text
+        elif local in XMP_QA_FIELDS:
+            values[local] = text
+    return values
+
+
+def _verify_image(source: Any, payload: bytes | None = None) -> None:
+    if isinstance(source, ArchiveImage):
+        data = _archive_member_bytes(source) if payload is None else payload
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+        return
+    with Image.open(source) as image:
+        image.verify()
+
+
+# A RedEdge-P band is a 16-bit single-channel TIFF holding raw sensor counts,
+# and the useful signal occupies a narrow part of the 0-65535 range: band 1 of
+# Flight_CCT0803 runs 4064-65504 with a mean near 15952. Two things follow, and
+# both used to break the sample strip.
+#
+# PIL cannot resize an "I;16" image at all - Image.thumbnail raises
+# "image has wrong mode" - so band 6, the 2464x2056 panchromatic one, produced
+# no thumbnail and was silently swallowed by the caller's except/continue.
+# And I;16 -> RGB clips every value above 255 rather than scaling, so the five
+# 1456x1088 bands that did survive came out uniformly 255: pure white boxes.
+#
+# Scaling to 8 bits first fixes both. The stretch is a percentile one because a
+# min/max stretch is set by single hot or dead pixels and leaves the scene flat.
+# This is a display transform for a quicklook only: nothing here is calibrated,
+# and no reflectance or index is computed anywhere in CC-FLUX.
+THUMBNAIL_SIZE = (480, 360)
+THUMBNAIL_STRETCH_PERCENTILES = (2.0, 98.0)
+
+
+def _eight_bit_for_display(image: Image.Image) -> Image.Image:
+    """An 8-bit image safe to resize and encode as JPEG.
+
+    Already-8-bit modes are returned untouched. Higher-precision single-channel
+    modes are linearly stretched between the 2nd and 98th percentile.
+    """
+    if image.mode in {"RGB", "L"}:
+        return image
+    if image.mode not in {"I;16", "I;16B", "I;16L", "I;16N", "I", "F"}:
+        return image.convert("RGB")
+    import numpy as np
+
+    samples = np.asarray(image)
+    finite = samples[np.isfinite(samples)] if samples.dtype.kind == "f" else samples
+    if not finite.size:
+        return Image.new("L", image.size)
+    low, high = np.percentile(finite, THUMBNAIL_STRETCH_PERCENTILES)
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        # A genuinely uniform band. Mid-grey says "read, and flat" rather than
+        # pretending to a contrast the data does not have.
+        return Image.new("L", image.size, color=128)
+    scaled = (samples.astype("float32") - float(low)) * (255.0 / (float(high) - float(low)))
+    return Image.fromarray(np.clip(scaled, 0, 255).astype("uint8"), mode="L")
+
+
+def _write_thumbnail(image: Image.Image, target: Path) -> None:
+    converted = _eight_bit_for_display(image)
+    converted.thumbnail(THUMBNAIL_SIZE)
+    converted.save(target, "JPEG", quality=80)
+
+
+def _save_thumbnail(source: Any, target: Path) -> None:
+    if isinstance(source, ArchiveImage):
+        with zipfile.ZipFile(source.archive) as bundle:
+            with bundle.open(source.member) as stream:
+                with Image.open(stream) as image:
+                    _write_thumbnail(image, target)
+        return
+    with Image.open(source) as image:
+        _write_thumbnail(image, target)
+
+
+def _asset_size(source: Any) -> int:
+    return source.size_bytes if isinstance(source, ArchiveImage) else source.stat().st_size
+
+
+def _asset_source(source: Any) -> str:
+    return (
+        f"{source.archive}::{source.member}"
+        if isinstance(source, ArchiveImage)
+        else str(source)
+    )
+
+
+def _image_sources(images: Sequence[Any]) -> list[SourceFile]:
+    return [
+        SourceFile(Path(_asset_source(image)), size_bytes=_asset_size(image))
+        for image in images
+    ]
+
+
+def _as_utc(value: Any) -> datetime | None:
+    """Normalise an option or record timestamp to UTC.
+
+    Campaign convention: MicaSense records UTC, so a naive EXIF value is read
+    as UTC rather than discarded.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _parse_timestamp(metadata: Mapping[str, Any]) -> datetime | None:
+    raw = metadata.get("DateTimeOriginal") or metadata.get("FileModifyDate")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    subsec = re.sub(r"\D", "", str(metadata.get("SubSecTime", "")))
+    for candidate in (text, re.sub(r"^(\d{4}):(\d{2}):(\d{2})", r"\1-\2-\3", text)):
+        try:
+            value = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            if subsec:
+                value = value.replace(microsecond=int((subsec + "000000")[:6]))
+            return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        except ValueError:
+            try:
+                value = datetime.strptime(candidate, "%Y:%m:%d %H:%M:%S")
+                if subsec:
+                    value = value.replace(microsecond=int((subsec + "000000")[:6]))
+                return value.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return None
+
+
+def _integer(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gps_present(metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("GPSLatitude") is not None and metadata.get("GPSLongitude") is not None
+
+
+# What a capture reports about the flight and the light it was taken in. Every
+# one of these comes from metadata already read; none is a derived radiometric
+# quantity. Order is the order the workspace plots them in.
+CAPTURE_CONDITION_FIELDS = (
+    "boot_timestamp",
+    "gps_latitude",
+    "gps_longitude",
+    "gps_altitude",
+    "pressure_alt",
+    "gps_dop",
+    "gps_xy_accuracy",
+    "gps_z_accuracy",
+    "exposure_time",
+    "iso_speed",
+    "dls_irradiance",
+    "dls_spectral_irradiance",
+    "dls_horizontal_irradiance",
+    "dls_direct_irradiance",
+    "dls_scattered_irradiance",
+    "dls_yaw",
+    "dls_pitch",
+    "dls_roll",
+    "solar_elevation",
+    "solar_azimuth",
+    "imager_temperature_c",
+)
+
+
+def _camera_identity(records: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """The rig, light sensor and flight the delivery names.
+
+    More than one value means the delivery mixes hardware or flights, so all of
+    them are reported rather than the first one silently standing for the rest.
+    """
+    identity: dict[str, str] = {}
+    for key in TRACEABILITY_FIELDS.values():
+        values = sorted({
+            str(record[key]) for record in records if record.get(key)
+        })
+        if values:
+            identity[key] = values[0] if len(values) == 1 else ", ".join(values)
+    return identity
+
+
+def _static_solar_geometry_warning(
+    captures: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Whether the light sensor stopped recomputing where the sun was.
+
+    Solar elevation moves several degrees an hour. On Flight_CCT0803 the DLS
+    reported 55.83 degrees from 13:17 to 15:51 while the true elevation fell
+    towards 30, so the recorded geometry is unusable for that part of the
+    flight. The values are still reported exactly as recorded; this only says
+    that they stopped changing.
+    """
+    points = [
+        (row["trigger_time"], row["solar_elevation"])
+        for row in captures
+        if row.get("trigger_time") is not None
+        and row.get("solar_elevation") is not None
+    ]
+    if len(points) < 2:
+        return None
+    span_hours = (points[-1][0] - points[0][0]).total_seconds() / 3600.0
+    # Recorded in radians; compared in degrees so the threshold reads as an
+    # angle a person can judge.
+    elevations = [degrees(value) for _, value in points]
+    spread = max(elevations) - min(elevations)
+    if span_hours < STATIC_SOLAR_MIN_HOURS or spread > STATIC_SOLAR_MAX_SPREAD_DEG:
+        return None
+    return (
+        f"Light sensor solar elevation varies by only {spread:.2f}° over "
+        f"{span_hours:.1f} h, which the sun does not. The recorded solar "
+        "geometry stopped updating and should not be used to correct this "
+        "flight; the irradiance readings themselves are unaffected."
+    )
+
+
+def _sample_panchromatic_quality(
+    captures: Sequence[MutableMapping[str, Any]],
+    step: int = SHARPNESS_SAMPLE_STEP,
+    check_cancelled: Callable[[], None] | None = None,
+) -> int:
+    """Decode band 6 of every step-th capture and attach its quality.
+
+    Sampled, not exhaustive: the panchromatic band is 10 MB and a flight has
+    thousands, so the reference reads every tenth and so does this. A capture
+    whose band 6 cannot be read is left without the fields rather than failing
+    the flight.
+    """
+    sampled = 0
+    for capture in captures:
+        number = capture.get("image_number")
+        archive = capture.get("archive")
+        if number is None or archive is None or step <= 0 or number % step:
+            continue
+        if check_cancelled is not None:
+            check_cancelled()
+        try:
+            # Not a "with": _open_archive hands back a handle cached for this
+            # thread and reused by the next call, so closing it here leaves the
+            # cache pointing at a closed ZipFile. One archive per capture hides
+            # that - each call opens a different one - but any layout that
+            # samples the same archive twice reads from a closed handle and
+            # loses the capture silently.
+            bundle = _open_archive(Path(archive))
+            member = next(
+                (name for name in bundle.namelist() if name.endswith("_6.tif")),
+                None,
+            )
+            if member is None:
+                continue
+            data = bundle.read(member)
+            capture.update(_sharpness_and_exposure(data))
+            sampled += 1
+        except Exception:  # noqa: BLE001 - see below
+            # Deliberately broad. The contract this function states is that a
+            # capture whose band 6 cannot be read is left without the fields
+            # rather than failing the flight, and the named list did not hold
+            # it: decoding a 10 MB panchromatic TIFF can raise things Pillow and
+            # numpy do not document, and Flight_CC0809 died at 76% after 97
+            # minutes because one of them escaped. One capture's quality is
+            # worth nothing against a flight's processing.
+            continue
+    return sampled
+
+
+def _normalised_intervals(
+    captures: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, float]]:
+    """Seconds per trigger, from the boot clock and the image-number gap.
+
+    The reference's definition. Dividing by the image-number difference is what
+    makes a gap in the numbering read as one slow interval instead of a spike,
+    and using the boot clock means a camera whose GPS never locked still gives a
+    usable cadence.
+    """
+    timed = [
+        (row["image_number"], row["boot_timestamp"])
+        for row in captures
+        if row.get("image_number") is not None
+        and row.get("boot_timestamp") is not None
+    ]
+    timed.sort()
+    intervals: list[tuple[int, float]] = []
+    for (n1, t1), (n2, t2) in zip(timed, timed[1:]):
+        dn, dt = n2 - n1, t2 - t1
+        if dn > 0 and dt > 0:
+            intervals.append((n2, dt / dn))
+    return intervals
+
+
+def _capture_quality_summary(
+    captures: Sequence[Mapping[str, Any]], expected_interval: float | None
+) -> dict[str, Any]:
+    """The reference dashboard's derived metrics, on the same definitions."""
+    intervals = _normalised_intervals(captures)
+    values = [value for _, value in intervals]
+    median_interval = median(values) if values else None
+    target = expected_interval or median_interval
+    gap_limit = target * 1.5 if target else None
+    sharpness = [
+        float(row["sharpness"]) for row in captures
+        if row.get("sharpness") is not None
+    ]
+    sharp_limit = (
+        float(np.percentile(sharpness, 5)) if sharpness else None
+    )
+    return {
+        "normalised_intervals": [
+            {"image_number": number, "seconds": value} for number, value in intervals
+        ],
+        "median_capture_interval_seconds": median_interval,
+        "capture_frequency_hz": (1 / median_interval) if median_interval else None,
+        "expected_interval_seconds": expected_interval,
+        "cadence_warning_threshold_seconds": gap_limit,
+        "cadence_outliers": (
+            sum(value > gap_limit for value in values) if gap_limit else 0
+        ),
+        "sharpness_samples": len(sharpness),
+        "sharpness_bottom_5_percent": sharp_limit,
+        "relative_blur_flags": (
+            sum(value <= sharp_limit for value in sharpness) if sharp_limit else 0
+        ),
+        "saturation_flags_over_1_percent": sum(
+            1 for row in captures
+            if float(row.get("saturated_fraction") or 0) > 0.01
+        ),
+    }
+
+
+def _capture_conditions(group: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The first recorded value of each condition across a capture's bands."""
+    result: dict[str, Any] = {}
+    for field in CAPTURE_CONDITION_FIELDS:
+        result[field] = next(
+            (
+                record[field]
+                for record in group
+                if record.get(field) is not None
+            ),
+            None,
+        )
+    return result
+
+
+def _capture_rows(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for record in records:
+        if record["capture_id"]:
+            groups[str(record["capture_id"])].append(record)
+    rows: list[dict[str, Any]] = []
+    for capture_id, group in groups.items():
+        bands = sorted(
+            {
+                int(record["band_number"])
+                for record in group
+                if record["band_number"] is not None
+            }
+        )
+        counts = Counter(record["band_number"] for record in group)
+        # A camera powered up without a clock write dates its frames from the
+        # epoch. Such a stamp says nothing about when the image was taken, and
+        # taken as a trigger time it put a 56-year interval in the list.
+        times = [
+            record["timestamp"]
+            for record in group
+            if record["timestamp"] and record["timestamp"].year >= 2000
+        ]
+        missing = sorted(EXPECTED_BANDS - set(bands))
+        duplicate_count = sum(max(0, count - 1) for band, count in counts.items() if band is not None)
+        rows.append(
+            {
+                "capture_id": capture_id,
+                "trigger_time": min(times) if times else None,
+                "file_count": len(group),
+                "found_bands": bands,
+                "missing_bands": missing,
+                "duplicate_band_files": duplicate_count,
+                "complete": not missing and len(group) == len(EXPECTED_BANDS) and not duplicate_count,
+                # The reference plots against image number and samples on it.
+                "image_number": _capture_number(
+                    *(record.get("file_name") for record in group),
+                    *(record.get("source_file") for record in group),
+                ),
+                "archive": next(
+                    (
+                        str(record["source_file"]).split("::", 1)[0]
+                        for record in group
+                        if "::" in str(record.get("source_file") or "")
+                    ),
+                    None,
+                ),
+                # One trigger fires all six bands, so the conditions belong to
+                # the capture. Taken from whichever band was read: the others
+                # are listed from the archive and carry no metadata.
+                **_capture_conditions(group),
+            }
+        )
+    rows.sort(key=lambda row: (row["trigger_time"] is None, row["trigger_time"] or datetime.max.replace(tzinfo=timezone.utc)))
+    return rows
+
+
+def _trigger_intervals(captures: Sequence[Mapping[str, Any]]) -> list[float]:
+    times = [row["trigger_time"] for row in captures if row["trigger_time"] is not None]
+    return [
+        (current - previous).total_seconds()
+        for previous, current in zip(times, times[1:])
+    ]
+
+
+def _sources(paths: Sequence[Path]) -> list[SourceFile]:
+    return [SourceFile(path, size_bytes=path.stat().st_size) for path in paths]
+
+
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    """Write every column any row carries, not only the first row's.
+
+    Sharpness and the intensity percentiles are measured on a sample of the
+    captures, so the rows are not all the same shape: the first one has none of
+    them and a later one does. Taking the header from rows[0] made DictWriter
+    raise on the first sampled capture - "dict contains fields not in
+    fieldnames: 'sharpness', 'p50', ..." - which failed the whole delivery
+    after 102 minutes of reading, with every number already computed.
+
+    Columns keep first-seen order, so the common ones stay at the front, and a
+    row without a sampled column is left blank rather than dropped.
+    """
+    fields: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _reject_existing(path: Path) -> None:
+    if path.exists():
+        raise FileExistsError(f"MicaSense Level 1 output already exists: {path}")

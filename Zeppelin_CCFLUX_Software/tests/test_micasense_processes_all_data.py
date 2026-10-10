@@ -1,0 +1,379 @@
+"""MicaSense must process the whole delivery, not the sample it was found by.
+
+Flight_CC0806 delivered 9,999 capture archives spanning 09:41 to 16:01. The
+instrument card reported "30 matching files" covering 14:59:28 to 15:00:58 and
+"Partial coverage: 0.3%", and the run processed about thirty captures.
+
+The cause is a wrapped filename counter. MicaSense restarts at IMG_0000 after
+IMG_9999, so IMG_0000.zip was taken at 15:00:03 and IMG_9999.zip at 15:00:01 -
+adjacent in time, at opposite ends of the name order. Discovery sampled exactly
+those two ends, so the estimate collapsed to the 90 seconds around the wrap, and
+the processing interval was then intersected with it.
+"""
+
+from __future__ import annotations
+
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("PIL")
+from PIL import Image
+
+from core.dashboard_time import (
+    SAMPLED_COVERAGE_INSTRUMENTS,
+    DashboardTimeState,
+    InstrumentTimeSelection,
+)
+from core.detector import InputCandidate
+from core.resource_manager import CameraBatchPolicy, ResourceLimits
+from core.scanner import (
+    BOUNDED_COVERAGE_SAMPLES,
+    DEFAULT_CANDIDATE_FILE_SAMPLES,
+    _CandidateAccumulator,
+)
+from instruments.micasense import MicaSenseLevel1Adapter
+
+
+class TestDiscoverySurvivesAWrappedCounter:
+    def _sample(self, count: int) -> list[Path]:
+        accumulator = _CandidateAccumulator("micasense", Path("/delivery"))
+        for index in range(count):
+            accumulator.add(
+                Path(f"/delivery/IMG_{index:04d}.zip"),
+                set(), 1.0, [], [], DEFAULT_CANDIDATE_FILE_SAMPLES,
+            )
+        return list(accumulator.bounded_sample())
+
+    def test_the_sample_reaches_the_middle_of_the_delivery(self):
+        sample = self._sample(9999)
+        numbers = sorted(int(path.stem.split("_")[1]) for path in sample)
+
+        # The old sample was the first 20 encountered plus ten names at each
+        # end: nothing between IMG_0019 and IMG_9990.
+        middle = [value for value in numbers if 1000 <= value <= 9000]
+        assert len(middle) >= 50, "a wrap makes the two ends adjacent in time"
+        assert numbers[0] == 0 and numbers[-1] == 9998
+
+    def test_the_spread_covers_the_whole_name_order(self):
+        numbers = sorted(
+            int(path.stem.split("_")[1]) for path in self._sample(9999)
+        )
+        gaps = [b - a for a, b in zip(numbers, numbers[1:])]
+
+        # No stretch of the delivery is unrepresented.
+        assert max(gaps) <= 9999 // BOUNDED_COVERAGE_SAMPLES + 1
+
+    def test_the_true_count_is_still_reported(self):
+        accumulator = _CandidateAccumulator("micasense", Path("/delivery"))
+        for index in range(9999):
+            accumulator.add(
+                Path(f"/delivery/IMG_{index:04d}.zip"),
+                set(), 1.0, [], [], DEFAULT_CANDIDATE_FILE_SAMPLES,
+            )
+
+        assert accumulator.matching_file_count == 9999
+        assert len(accumulator.bounded_sample()) < 9999
+
+    def test_a_small_delivery_is_sampled_whole(self):
+        sample = self._sample(12)
+        assert len(sample) == 12
+
+    def test_the_sample_stays_bounded(self):
+        assert len(self._sample(100_000)) <= BOUNDED_COVERAGE_SAMPLES + \
+            DEFAULT_CANDIDATE_FILE_SAMPLES + 2
+
+
+class TestARunIsNotNarrowedToTheSample:
+    def _backend(self, tmp_path, available, selected):
+        from app.scan_backend import DashboardScanBackend
+
+        backend = DashboardScanBackend(tmp_path)
+        state = DashboardTimeState()
+        state.selected_analysis_start, state.selected_analysis_end = selected
+        for name in ("micasense", "noseboom"):
+            state.instruments[name] = InstrumentTimeSelection(
+                name, available[0], available[1]
+            )
+        backend._time_state = state
+        return backend
+
+    def test_micasense_keeps_the_operator_interval(self, tmp_path):
+        wrap = (
+            datetime(2026, 8, 6, 14, 59, 28, tzinfo=timezone.utc),
+            datetime(2026, 8, 6, 15, 0, 58, tzinfo=timezone.utc),
+        )
+        flight = (
+            datetime(2026, 8, 6, 9, 41, tzinfo=timezone.utc),
+            datetime(2026, 8, 6, 16, 1, tzinfo=timezone.utc),
+        )
+        backend = self._backend(tmp_path, wrap, flight)
+
+        start, end = backend._instrument_processing_interval("micasense")
+
+        assert (start, end) == flight, "the sampled 90 s must not bound the run"
+
+    def test_an_instrument_with_real_coverage_is_still_narrowed(self, tmp_path):
+        available = (
+            datetime(2026, 8, 6, 10, tzinfo=timezone.utc),
+            datetime(2026, 8, 6, 12, tzinfo=timezone.utc),
+        )
+        selected = (
+            datetime(2026, 8, 6, 9, tzinfo=timezone.utc),
+            datetime(2026, 8, 6, 16, tzinfo=timezone.utc),
+        )
+        backend = self._backend(tmp_path, available, selected)
+
+        assert backend._instrument_processing_interval("noseboom") == available
+
+    def test_the_sampled_set_is_the_declared_one(self):
+        assert "micasense" in SAMPLED_COVERAGE_INSTRUMENTS
+
+
+def test_one_band_is_read_per_capture(tmp_path, monkeypatch):
+    """The bands of a capture share a trigger time; reading two invented a duplicate."""
+    from core import time_extraction
+
+    archive_path = tmp_path / "IMG_0000.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for band in range(1, 7):
+            archive.writestr(f"IMG_0000_{band}.tif", b"tiff-placeholder")
+
+    consulted: list[str] = []
+
+    def fake_exif(source):
+        consulted.append("read")
+        return "2026:08:06 15:00:03"
+
+    monkeypatch.setattr(time_extraction, "_exif_original_datetime", fake_exif)
+    result = time_extraction.TimestampExtractor().extract_instrument(
+        "micasense", [archive_path]
+    )
+
+    assert len(consulted) == 1, "one archive is one capture; one band dates it"
+    assert result.duplicated_timestamps == 0
+    assert not any(
+        "duplicated timestamp" in text
+        for text in result.timestamp_quality_warnings
+    )
+
+
+def _band(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("L", (16, 12), color=100).save(path, format="TIFF")
+
+
+def _reader(path: Path):
+    capture = int(Path(path).stem.split("_")[1])
+    band = int(Path(path).stem.rsplit("_", 1)[1])
+    stamp = datetime(2026, 8, 6, 9, 41, tzinfo=timezone.utc) + timedelta(
+        minutes=capture
+    )
+    return {
+        "CaptureId": f"IMG_{capture:04d}",
+        "BandNumber": band,
+        "BandName": f"Band {band}",
+        "DateTimeOriginal": stamp.strftime("%Y:%m:%d %H:%M:%S"),
+        "GPSLatitude": 52.0,
+        "GPSLongitude": 13.0,
+        "GPSAltitude": 500.0,
+        "ExposureTime": 0.002,
+        "ISOSpeed": 100,
+    }
+
+
+def test_the_delivery_coverage_is_reported_over_every_capture(tmp_path):
+    """Measured before the Time Filter narrows anything, so it can replace the estimate."""
+    raw = tmp_path / "raw"
+    for capture in range(6):
+        for band in range(1, 4):
+            _band(raw / f"IMG_{capture:04d}_{band}.tif")
+    adapter = MicaSenseLevel1Adapter(
+        output_root=tmp_path / "out",
+        flight_name="Flight_CC0806",
+        resource_limits=ResourceLimits(cpu_cores=1, memory_bytes=1 << 28),
+        batch_policy=CameraBatchPolicy(
+            maximum_batch_files=8, maximum_thumbnail_count=2,
+            maximum_thumbnail_bytes=4 * 1024**2,
+        ),
+        metadata_reader=_reader,
+        unusually_small_bytes=1,
+    )
+    candidate = InputCandidate(
+        "micasense", tuple(sorted(raw.rglob("*.tif"))), 1.0, "synthetic"
+    )
+    loaded = adapter.load(candidate)
+
+    # A filter that keeps only the middle of the delivery.
+    result = adapter.process_quicklook(
+        loaded,
+        {
+            "analysis_start": datetime(2026, 8, 6, 9, 43, tzinfo=timezone.utc),
+            "analysis_end": datetime(2026, 8, 6, 9, 44, tzinfo=timezone.utc),
+        },
+    )
+
+    # The evaluated window is narrow...
+    assert result.metadata["capture_count"] == 2
+    # ...but the delivery's own coverage still spans every capture delivered.
+    assert result.metadata["delivered_utc_start"].startswith("2026-08-06T09:41")
+    assert result.metadata["delivered_utc_end"].startswith("2026-08-06T09:46")
+
+
+def test_the_run_publishes_measured_coverage_back_to_the_card():
+    source = (Path(__file__).parents[1] / "app" / "scan_backend.py").read_text(
+        encoding="utf-8"
+    )
+    body = source[source.index("def _micasense_quick_task("):]
+    body = body[: body.find("\n    def ", 1)]
+
+    assert 'result.metadata.get("delivered_utc_start")' in body
+    assert "state.utc_start_time = measured_start" in body
+    assert "_rebuild_time_state()" in body
+
+
+class TestASampledWindowIsNotReportedAsMissingData:
+    """MicaSense read 66.1% on Flight_CC0807 with all 9 999 captures present.
+
+    A camera's window comes from a bounded sample of its deliveries - 147 of
+    9 999 - so the figure is the extent of what was read, not of what was
+    recorded. Shown bare, and in amber as "Partial coverage", it said a third
+    of the flight was missing. Processing re-globs the folder and reads every
+    file regardless, which is why the run then produced the lot.
+    """
+
+    def test_the_instruments_with_an_estimated_window_are_marked(self):
+        from core.dashboard_time import (
+            ESTIMATED_WINDOW_INSTRUMENTS, InstrumentTimeSelection,
+        )
+
+        assert ESTIMATED_WINDOW_INSTRUMENTS == {"flir", "gopro"}
+        assert InstrumentTimeSelection("flir", None, None).coverage_is_estimated is False
+
+    def test_the_flag_is_set_where_the_selection_is_built(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "core" / "dashboard_time.py"
+        ).read_text(encoding="utf-8")
+        assert (
+            "coverage_is_estimated=instrument_id in ESTIMATED_WINDOW_INSTRUMENTS"
+            in source
+        )
+
+    def test_it_reaches_the_browser(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "core" / "dashboard_time.py"
+        ).read_text(encoding="utf-8")
+        assert '"coverage_is_estimated": value.coverage_is_estimated,' in source
+
+    def test_a_measured_instrument_keeps_the_amber_warning(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "app" / "assets" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        assert "Partial coverage: " in script
+        assert "var(--amber)" in script
+
+    def test_a_sampled_instrument_says_it_was_sampled(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "app" / "assets" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        assert "Window estimated from a sample of the deliveries" in script
+        assert "Every file is read when this instrument is processed." in script
+        assert "(sampled)" in script
+
+    def test_the_timeline_marks_the_figure_as_approximate(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "app" / "assets" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        timeline = script[script.index("function renderAvailabilityTimeline"):]
+        timeline = timeline[: timeline.index("\n  function ")]
+        assert "coverage_is_estimated" in timeline
+        assert "\u2248" in timeline
+
+
+class TestTheRecordedWindowIsReadFromEveryCapture:
+    """Flight_CC0807 showed 66.1% with all 9 983 captures present.
+
+    The window came from 128 archives chosen along the name order, and the
+    capture counter wraps at IMG_9999, so the earliest captures were not among
+    them: the sample began at 10:59 where the camera began at 07:54. Three
+    hours of a flight were invisible.
+
+    A MicaSense TIFF keeps its first IFD at the end of the file, so the EXIF
+    costs 378 ms an archive - 63 minutes for the delivery. The archive's own
+    entry stamp costs a seek and no decompression, and differs from the EXIF by
+    the camera clock's offset plus the moment it takes to write. Measured
+    against a few EXIF reads and subtracted, it gives every capture's real time
+    in 17 seconds:
+
+        sampled   10:59:04 .. 15:45:50    66.1% of the interval
+        measured  07:54:02 .. 15:46:48   100.0%
+    """
+
+    def _archive(self, path, stamp, exif=None):
+        import zipfile
+        with zipfile.ZipFile(path, "w") as archive:
+            info = zipfile.ZipInfo("IMG_0000_1.tif", date_time=stamp)
+            archive.writestr(info, b"II*\x00" + b"\x00" * 64)
+        return path
+
+    def test_the_entry_stamp_is_read_without_decompressing(self, tmp_path):
+        from core.time_extraction import TimestampExtractor
+
+        path = self._archive(tmp_path / "IMG_0000.zip", (2026, 8, 7, 9, 54, 2))
+        assert TimestampExtractor._micasense_entry_time(path) == datetime(
+            2026, 8, 7, 9, 54, 2
+        )
+
+    def test_an_unreadable_archive_is_skipped_not_raised(self, tmp_path):
+        from core.time_extraction import TimestampExtractor
+
+        broken = tmp_path / "IMG_0001.zip"
+        broken.write_text("not a zip", encoding="utf-8")
+        assert TimestampExtractor._micasense_entry_time(broken) is None
+
+    def test_without_an_anchor_nothing_is_claimed(self, tmp_path):
+        """A window on the wrong clock is worse than one read from a sample."""
+        from core.time_extraction import TimestampExtractor
+
+        for index in range(40):
+            self._archive(tmp_path / f"IMG_{index:04d}.zip", (2026, 8, 7, 9, 0, 0))
+        extractor = TimestampExtractor()
+        # The stub TIFFs carry no EXIF, so no offset can be measured.
+        assert extractor._read_micasense_times(sorted(tmp_path.glob("*.zip"))) == {}
+
+    def test_the_bulk_read_is_wired_into_extraction(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "core" / "time_extraction.py"
+        ).read_text(encoding="utf-8")
+        assert "self._micasense_times = self._read_micasense_times(source_files)" in source
+        assert 'instrument_id == "micasense"' in source
+
+    def test_the_reads_overlap(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "core" / "time_extraction.py"
+        ).read_text(encoding="utf-8")
+        body = source[source.index("def _read_micasense_times("):]
+        body = body[: body.index("\n    def ")]
+        assert "ThreadPoolExecutor(max_workers=self.MICASENSE_STAMP_READERS)" in body
+
+    def test_validation_is_given_every_archive(self):
+        backend = (
+            Path(__file__).resolve().parents[1] / "app" / "scan_backend.py"
+        ).read_text(encoding="utf-8")
+        start = backend.index("def _validation_source_files(")
+        body = backend[start: backend.index("\n    def ", start + 1)]
+        assert 'instrument_id == "micasense"' in body
+        assert 'root.rglob("*")' in body
+
+    def test_micasense_no_longer_reports_an_estimated_window(self):
+        from core.dashboard_time import (
+            ESTIMATED_WINDOW_INSTRUMENTS, SAMPLED_COVERAGE_INSTRUMENTS,
+        )
+
+        assert "micasense" not in ESTIMATED_WINDOW_INSTRUMENTS
+        assert ESTIMATED_WINDOW_INSTRUMENTS == {"flir", "gopro"}
+        # Its per-capture instants still say nothing about the stretches
+        # between them, so that judgement is unchanged.
+        assert "micasense" in SAMPLED_COVERAGE_INSTRUMENTS
